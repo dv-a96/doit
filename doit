@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+import argparse
+import subprocess
+from llm_brain import query_llm
+
+def run_shell(command: str, shell: str = "/bin/bash"):
+    result = subprocess.run(
+        command,
+        shell=True,
+        executable=shell,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    return {
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "returncode": result.returncode,
+    }
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run a natural-language instruction through the AI agent"
+    )
+    parser.add_argument(
+        "instruction",
+        nargs=argparse.REMAINDER,
+        help="Your instruction in natural language",
+    )
+    args = parser.parse_args()
+
+    if not args.instruction:
+        parser.error("the following arguments are required: instruction")
+
+    user_instruction = args.instruction
+    
+    # Call the LLM to get the action type and content
+    ai_response = query_llm(user_instruction)
+    
+    action_type = ai_response.get("action_type")
+    content = ai_response.get("content", "")
+    
+    # Route based on action type
+    if action_type == "command":
+        print(content)
+        
+        # Execute command
+        execution_result = run_shell(content)
+        
+        # Print the output and error if any
+        if execution_result["stdout"]:
+            print(execution_result["stdout"], end="")
+        if execution_result["stderr"]:
+            print(f"Error output:\n{execution_result['stderr']}", end="")
+            
+    elif action_type == "chat":
+        # The model is providing a chat response
+        print(content)
+        
+    elif action_type == "error":
+        print(f"Agent Error: {content}")
+        
+    else:
+        print(f"Unknown action type received: {action_type}")
+
+if __name__ == "__main__":
+    main()
