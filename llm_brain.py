@@ -92,14 +92,14 @@ The JSON must strictly follow this structure:
 Rules:
 1. If the user wants to do something in the terminal (list files, delete, move, create, network check), set action_type to 'command' and provide the EXACT shell command.
 2. If they ask for a joke, chat, or explanation, set action_type to 'chat' and provide the response text.
-3. If the request is impossible or unachievable in a shell, set action_type to 'error' and explain why."""
+3. If the request is impossible or unachievable in a shell, set action_type to 'error' and give an explantion why you cannot do it as an ai based command line assistant."""
 
     try:
         response = litellm.completion(
             model=model,
             custom_llm_provider=provider,
-            # Pass only the user message to keep the messages structure flat and safe
             messages=[
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_instruction}
             ],
             # Pass system instructions natively through the parameter Gemini expects
