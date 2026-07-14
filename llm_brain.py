@@ -1,6 +1,11 @@
 import os
 import json
+import re
 import litellm
+
+# Silencing LiteLLM output and debugging helpers
+litellm.suppress_warnings = True
+os.environ["LITELLM_LOG"] = "ERROR" # Suppress info/warning logs from LiteLLM
 
 def load_config() -> dict:
     """
@@ -41,6 +46,7 @@ def load_config() -> dict:
 
     return {**defaults, **parsed_config}
 
+
 def clean_json_markdown(text: str) -> str:
     """
     Safely removes markdown code blocks (e.g., ```json ... ```) from the model's response.
@@ -62,6 +68,58 @@ def clean_json_markdown(text: str) -> str:
         text = "\n".join(lines).strip()
         
     return text
+
+
+def _check_command_safety(command: str) -> dict:
+    """
+    Analyzes a generated bash command using a separate, secondary LLM call.
+    Determines if the command modifies the filesystem or system state.
+    Returns a dict: {"is_destructive": bool, "explanation": str}
+    """
+    config = load_config()
+    model = config["model"]
+    provider = config["provider"]
+    
+    if config.get("gemini_api_key"):
+        os.environ["GEMINI_API_KEY"] = config["gemini_api_key"]
+        os.environ["GOOGLE_API_KEY"] = config["gemini_api_key"]
+
+    safety_system_prompt = """You are a security compliance tool for a CLI agent.
+Your job is to analyze a bash command and decide if it modifies the filesystem or system state (creates, moves, deletes, edits files/directories, installs packages, write modifications, etc.).
+
+Strict Rules:
+1. Commands that ONLY display information or read state (like 'ls', 'grep', 'cat', 'pwd', 'echo', 'head', 'find', 'diff') are NOT dangerous/destructive. For these, you MUST set is_destructive to false.
+2. Commands that modify the filesystem (like 'rm', 'mv', 'mkdir', 'touch', 'cp', 'chmod', 'chown', or output redirections like '>' and '>>') are dangerous. For these, you MUST set is_destructive to true.
+
+You must ONLY respond with a valid JSON object. Do not include any markdown formatting (NO ```json blocks), no thoughts, and no extra text.
+The JSON must strictly follow this structure:
+{
+  "is_destructive": true | false,
+  "explanation": "A short sentence explaining what the command does to the filesystem"
+}"""
+
+    try:
+        response = litellm.completion(
+            model=model,
+            custom_llm_provider=provider,
+            messages=[
+                {"role": "system", "content": safety_system_prompt},
+                {"role": "user", "content": f"Analyze this command: {command}"}
+            ],
+            system_instruction=safety_system_prompt,
+            temperature=0.0
+        )
+        
+        raw_content = response.choices[0].message.content
+        cleaned_content = clean_json_markdown(raw_content)
+        return json.loads(cleaned_content)
+        
+    except Exception:
+        # Fallback to safe mode (assume dangerous) if the LLM call or parsing fails
+        return {
+            "is_destructive": True,
+            "explanation": "Could not verify command safety automatically. Assuming potentially destructive."
+        }
 
 def query_llm(user_instruction: str) -> dict:
     """
@@ -110,10 +168,30 @@ Rules:
         raw_content = response.choices[0].message.content
         cleaned_content = clean_json_markdown(raw_content)
         
-        return json.loads(cleaned_content)
+        parsed_response = json.loads(cleaned_content)
+        
+        # =====================================================================
+        # NEW SAFETY ENRICHMENT STEP
+        # =====================================================================
+        # If the generated action is indeed a terminal command, invoke the separate safety tool
+        if parsed_response.get("action_type") == "command":
+            command = parsed_response.get("content", "")
+            safety_info = _check_command_safety(command)
+            
+            # Enrich the response dictionary with the safety flags required by doit
+            parsed_response["is_destructive"] = safety_info.get("is_destructive", True)
+            parsed_response["explanation"] = safety_info.get("explanation", "")
+        else:
+            # If it's a chat or error, default safety flags to safe values
+            parsed_response["is_destructive"] = False
+            parsed_response["explanation"] = ""
+            
+        return parsed_response
         
     except Exception as e:
         return {
             "action_type": "error",
-            "content": f"Failed to get or parse response from model ({model}). Error: {str(e)}"
+            "content": f"Failed to get or parse response from model ({model}). Error: {str(e)}",
+            "is_destructive": False,
+            "explanation": ""
         }

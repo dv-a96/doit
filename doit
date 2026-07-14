@@ -20,7 +20,7 @@ def run_shell(command: str, shell: str = "/bin/bash"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run a natural-language instruction through the AI agent"
+        description="Run a natural-language instruction through the AI agent with safety checks"
     )
     parser.add_argument(
         "instruction",
@@ -34,17 +34,36 @@ def main():
 
     user_instruction = args.instruction
     
-    # Call the LLM to get the action type and content
+    # Call the LLM to get the action type, content, and enriched safety details
     ai_response = query_llm(user_instruction)
     
     action_type = ai_response.get("action_type")
     content = ai_response.get("content", "")
+    is_destructive = ai_response.get("is_destructive", False)
+    explanation = ai_response.get("explanation", "")
     
     # Route based on action type
     if action_type == "command":
+        # Interactive safety guard for destructive actions affecting the filesystem
+        if is_destructive:
+            print("\n⚠️  [SAFETY WARNING]: This command will modify your system/filesystem!")
+            print(f"👉 Proposed Command: {content}")
+            print(f"ℹ️  What it does:     {explanation}")
+            
+            try:
+                user_choice = input("Do you want to proceed? [y/N]: ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\nOperation cancelled by user.")
+                return
+                
+            if user_choice != 'y':
+                print("Operation cancelled. No changes were made.")
+                return
+        
+        # Print the exact command to be executed first
         print(content)
         
-        # Execute command
+        # Execute the final authorized command
         execution_result = run_shell(content)
         
         # Print the output and error if any
