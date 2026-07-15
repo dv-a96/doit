@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import subprocess
+import history_manager
 from llm_brain import query_llm
 
 def run_shell(command: str, shell: str = "/bin/bash"):
+    """
+    Executes a bash command, capturing stdout, stderr, and the return code.
+    """
     result = subprocess.run(
         command,
         shell=True,
@@ -20,7 +24,13 @@ def run_shell(command: str, shell: str = "/bin/bash"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run a natural-language instruction through the AI agent with safety checks"
+        description="Run a natural-language instruction through the AI agent with safety checks and conversation history"
+    )
+    # Add flag to allow the user to clear the history
+    parser.add_argument(
+        "--clear", "-c",
+        action="store_true",
+        help="Clear the conversation history and start fresh"
     )
     parser.add_argument(
         "instruction",
@@ -29,12 +39,19 @@ def main():
     )
     args = parser.parse_args()
 
-    if not args.instruction:
-        parser.error("the following arguments are required: instruction")
+    # Handle history clearance request
+    if args.clear:
+        history_manager.clear_history()
+        print("🧹 Conversation history cleared.")
+        return
 
-    user_instruction = args.instruction
+    if not args.instruction:
+        parser.error("the following arguments are required: instruction or --clear")
+
+    # Join remainder list arguments to construct the full string
+    user_instruction = " ".join(args.instruction) if isinstance(args.instruction, list) else args.instruction
     
-    # Call the LLM to get the action type, content, and enriched safety details
+    # Query LLM (the turn is automatically appended to local history during the query)
     ai_response = query_llm(user_instruction)
     
     action_type = ai_response.get("action_type")
@@ -42,7 +59,6 @@ def main():
     is_destructive = ai_response.get("is_destructive", False)
     explanation = ai_response.get("explanation", "")
     
-    # Route based on action type
     if action_type == "command":
         # Interactive safety guard for destructive actions affecting the filesystem
         if is_destructive:
@@ -54,10 +70,21 @@ def main():
                 user_choice = input("Do you want to proceed? [y/N]: ").strip().lower()
             except (KeyboardInterrupt, EOFError):
                 print("\nOperation cancelled by user.")
+                # Save canceled execution status in history
+                history_manager.update_last_turn_execution({
+                    "stdout": "",
+                    "stderr": "Command cancelled by user.",
+                    "returncode": 130
+                })
                 return
                 
             if user_choice != 'y':
                 print("Operation cancelled. No changes were made.")
+                history_manager.update_last_turn_execution({
+                    "stdout": "",
+                    "stderr": "Command cancelled by user.",
+                    "returncode": 1
+                })
                 return
         
         # Print the exact command to be executed first
@@ -66,6 +93,9 @@ def main():
         # Execute the final authorized command
         execution_result = run_shell(content)
         
+        # Update the saved history turn with the actual terminal execution result
+        history_manager.update_last_turn_execution(execution_result)
+        
         # Print the output and error if any
         if execution_result["stdout"]:
             print(execution_result["stdout"], end="")
@@ -73,7 +103,7 @@ def main():
             print(f"Error output:\n{execution_result['stderr']}", end="")
             
     elif action_type == "chat":
-        # The model is providing a chat response
+        # Print a normal assistant chat response
         print(content)
         
     elif action_type == "error":

@@ -1,8 +1,11 @@
+# llm_brain.py
 import os
 import json
 import re
 import litellm
 import warnings
+import history_managment
+
 # Suppress Pydantic serialization warnings caused by LiteLLM / Gemini tool call formats
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
@@ -11,13 +14,10 @@ litellm.suppress_warnings = True
 os.environ["LITELLM_LOG"] = "ERROR"
 
 def load_config() -> dict:
-    """
-    Load configuration from ~/doit.cfg. 
-    Returns a dict with safely fallback defaults if the file doesn't exist.
-    """
+    """Load configuration from ~/doit.cfg."""
     cfg_path = os.path.expanduser("~/doit.cfg")
     defaults = {
-        "model": "gemini-2.5-flash",  # Updated to latest stable Gemini model without prefix
+        "model": "gemini-2.5-flash",
         "provider": "gemini",
         "gemini_api_key": ""
     }
@@ -51,43 +51,26 @@ def load_config() -> dict:
 
 
 def clean_json_markdown(text: str) -> str:
-    """
-    Safely removes markdown code blocks (e.g., ```json ... ```) from the model's response.
-    Handles unexpected leading/trailing whitespaces, newlines, or casing.
-    """
+    """Safely removes markdown code blocks from the model's response."""
     text = text.strip()
-    
-    # Check if the text is wrapped in markdown code blocks
     if text.startswith("```"):
-        # Remove the starting fence (e.g., ```json or ```)
-        # We split by newline, drop the first line, and drop the last line if it's the closing fence
         lines = text.splitlines()
-        
         if lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
-            
         text = "\n".join(lines).strip()
-        
     return text
 
 
 def _check_command_safety(command: str) -> dict:
-    """
-    Analyzes a generated bash command. This is the implementation of the Tool 
-    called by the LLM. It determines if the command modifies the filesystem.
-    """
-    # Simple, highly reliable rule-based check to avoid a third LLM call if possible,
-    # fallback to LLM analysis for ambiguous commands.
+    """Analyzes a generated bash command to check if it modifies the filesystem."""
     command_clean = command.strip().split()
     if not command_clean:
         return {"is_destructive": False, "explanation": "Empty command."}
         
     base_cmd = command_clean[0]
     safe_commands = {"ls", "grep", "cat", "pwd", "echo", "head", "tail", "find", "diff", "env"}
-    
-    # Check for redirection characters which inherently modify files
     has_redirection = any(char in command for char in (">", ">>", "|"))
 
     if base_cmd in safe_commands and not has_redirection:
@@ -96,7 +79,6 @@ def _check_command_safety(command: str) -> dict:
             "explanation": f"The command '{base_cmd}' only reads or displays information."
         }
 
-    # If it's not obviously safe, we query the LLM to verify safety (Secondary Call)
     config = load_config()
     model = config["model"]
     provider = config["provider"]
@@ -129,11 +111,43 @@ Only 'read-only' commands are safe (is_destructive: false). Anything that writes
         }
 
 
+def build_messages_with_history(system_prompt: str, user_instruction: str) -> list:
+    """
+    Combines system prompt, saved history turns, and the current user instruction
+    into a structured list of messages for the LLM.
+    """
+    turns = history_manager.get_all_turns()
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    for turn in turns:
+        # 1. Add user's original request
+        messages.append({"role": "user", "content": turn["user_instruction"]})
+        
+        # 2. Add assistant's JSON response (as a string)
+        assistant_json_str = json.dumps(turn["assistant_response"])
+        messages.append({"role": "assistant", "content": assistant_json_str})
+        
+        # 3. Add execution output feedback (if exists)
+        exec_res = turn.get("execution_result")
+        if exec_res:
+            feedback = (
+                f"System execution output of the command was:\n"
+                f"Exit Code: {exec_res.get('returncode')}\n"
+                f"STDOUT: {exec_res.get('stdout', '').strip()}\n"
+                f"STDERR: {exec_res.get('stderr', '').strip()}"
+            )
+            messages.append({
+                "role": "user", 
+                "content": feedback
+            })
+            
+    # Finally, append the current user instruction
+    messages.append({"role": "user", "content": user_instruction})
+    return messages
+
+
 def query_llm(user_instruction: str) -> dict:
-    """
-    Send the request to the LLM. Registers tools in the System context, 
-    executes them if requested by the model, and returns the structured response.
-    """
+    """Send the request to the LLM including multi-turn history context."""
     config = load_config()
     model = config["model"]
     provider = config["provider"]
@@ -147,7 +161,6 @@ def query_llm(user_instruction: str) -> dict:
     else:
         user_instruction = str(user_instruction)
 
-    # 1. Define the tool formally (matches 'sys.safety_tool_definition' in ACDL)
     tools = [
         {
             "type": "function",
@@ -168,11 +181,11 @@ def query_llm(user_instruction: str) -> dict:
         }
     ]
 
-    system_prompt = """You are the brain of a CLI agent named 'doit'.
+    system_prompt = """You are the brain of a CLI agent named 'doit'. You support multi-turn conversations.
+Analyze the history of previous commands and their execution outputs provided in the message thread to resolve pronouns (like 'them', 'it', 'that') and context-specific adjustments (like 'no, I meant...').
 
 Rules:
-1. If the user wants to run or perform ANY action in the terminal (including printing/echoing text, listing files, deleting, moving, creating, network check), you MUST treat this as a terminal command. 
-   - For example: if the user says "print hello" you MUST generate the command "echo hello" and set action_type to "command".
+1. If the user wants to run or perform ANY action in the terminal (including printing/echoing text, listing files, deleting, moving, creating, network check), you MUST treat this as a terminal command.
    - You MUST call the 'call_safety_check' tool with the exact command before returning the final response.
 2. If the user explicitly asks for a joke, conversational chat, or general AI explanation (not a terminal action), set action_type to 'chat', provide the text in 'content', set is_destructive to false, and explanation to empty.
 3. If you are not calling a tool (or after you receive the tool results), you must ONLY respond with a valid JSON object. Do not include any markdown formatting (NO ```json blocks), no thoughts, and no extra text.
@@ -183,15 +196,12 @@ Rules:
      "is_destructive": true | false,
      "explanation": "the explanation returned by the safety tool, or empty if not a command"
    }
-4. If the request is impossible, unachievable in a CLI shell, or contains physical actions/nonsense commands (like "jump high", "fly to the moon"), you MUST set action_type to "error" and explain in the content that as an AI CLI assistant you cannot perform physical or impossible tasks."""
+4. If the request is impossible, unachievable in a CLI shell, or contains physical actions/nonsense commands, set action_type to "error" and explain in content."""
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_instruction}
-    ]
+    # Using the dynamic history messages builder
+    messages = build_messages_with_history(system_prompt, user_instruction)
 
     try:
-        # First turn: Send user input and register the tools
         response = litellm.completion(
             model=model,
             custom_llm_provider=provider,
@@ -203,19 +213,15 @@ Rules:
         
         message = response.choices[0].message
         
-        # Check if the LLM decided to call our safety tool (matches ACDL conditional block)
         if message.get("tool_calls"):
             tool_call = message["tool_calls"][0]
             tool_name = tool_call.function.name
             tool_args = json.loads(tool_call.function.arguments)
             
-            # Execute the local function corresponding to the tool
             if tool_name == "call_safety_check":
                 command_to_test = tool_args.get("command")
-                # Call local safety tool logic
                 tool_result = _check_command_safety(command_to_test)
                 
-                # Append assistant's intent to call tool, and the tool's feedback to the thread
                 messages.append(message)
                 messages.append({
                     "role": "tool",
@@ -224,7 +230,6 @@ Rules:
                     "content": json.dumps(tool_result)
                 })
                 
-                # Second turn: Send the tool result back to the LLM so it can construct the final JSON
                 second_turn_prompt = """You are the brain of a CLI agent named 'doit'.
 You have received the safety check result for the command.
 You MUST respond with a valid JSON object. Do not include any markdown formatting, no thoughts, and no extra text.
@@ -235,8 +240,7 @@ The JSON structure must be:
   "content": "<the exact command that was tested>",
   "is_destructive": true | false,
   "explanation": "<the explanation from the safety tool>"
-}
-DO NOT refuse the command, do not return an error, and do not write chat messages. Copy the values from the tool exactly."""
+}"""
                 messages[0]["content"] = second_turn_prompt
 
                 second_response = litellm.completion(
@@ -246,7 +250,6 @@ DO NOT refuse the command, do not return an error, and do not write chat message
                     system_instruction=second_turn_prompt,
                     temperature=0.0
                 )
-                
                 raw_content = second_response.choices[0].message.content
             else:
                 raw_content = message.content
@@ -254,7 +257,12 @@ DO NOT refuse the command, do not return an error, and do not write chat message
             raw_content = message.content
 
         cleaned_content = clean_json_markdown(raw_content)
-        return json.loads(cleaned_content)
+        final_response_dict = json.loads(cleaned_content)
+        
+        # Saving the new turn to the local history
+        history_manager.add_turn(user_instruction, final_response_dict)
+        
+        return final_response_dict
         
     except Exception as e:
         return {
