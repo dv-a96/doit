@@ -4,7 +4,7 @@ import json
 import re
 import litellm
 import warnings
-import history_managment
+import history_manager
 
 # Suppress Pydantic serialization warnings caused by LiteLLM / Gemini tool call formats
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
