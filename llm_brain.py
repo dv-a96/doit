@@ -103,7 +103,7 @@ def _check_command_safety(command: str) -> dict:
   "is_destructive": true | false,
   "explanation": "Brief description of filesystem impact"
 }
-Only 'read-only' commands are safe (is_destructive: false). Anything that writes, deletes, moves, installs, creates, modifies or edits is destructive (is_destructive: true)."""
+Only 'read-only' commands are safe (is_destructive: false). Anything that writes, deletes, moves, installs, modifies or edits is destructive (is_destructive: true)."""
 
     try:
         response = litellm.completion(
@@ -168,8 +168,11 @@ def query_llm(user_instruction: str) -> dict:
     system_prompt = """You are the brain of a CLI agent named 'doit'.
 
 Rules:
-1. If the user wants to run a terminal command, you MUST call the 'call_safety_check' tool with the exact command.
-2. If you are not calling a tool (or after you receive the tool results), you must ONLY respond with a valid JSON object. Do not include any markdown formatting (NO ```json blocks), no thoughts, and no extra text.
+1. If the user wants to run or perform ANY action in the terminal (including printing/echoing text, listing files, deleting, moving, creating, network check), you MUST treat this as a terminal command. 
+   - For example: if the user says "print hello" you MUST generate the command "echo hello" and set action_type to "command".
+   - You MUST call the 'call_safety_check' tool with the exact command before returning the final response.
+2. If the user explicitly asks for a joke, conversational chat, or general AI explanation (not a terminal action), set action_type to 'chat', provide the text in 'content', set is_destructive to false, and explanation to empty.
+3. If you are not calling a tool (or after you receive the tool results), you must ONLY respond with a valid JSON object. Do not include any markdown formatting (NO ```json blocks), no thoughts, and no extra text.
    The JSON structure must be:
    {
      "action_type": "command" | "chat" | "error",
@@ -177,7 +180,6 @@ Rules:
      "is_destructive": true | false,
      "explanation": "the explanation returned by the safety tool, or empty if not a command"
    }
-3. If they ask for a joke, chat, or explanation, set action_type to 'chat', provide the text in 'content', set is_destructive to false, and explanation to empty.
 4. If the request is impossible, set action_type to 'error' with an explanation, set is_destructive to false, and explanation to empty."""
 
     messages = [
