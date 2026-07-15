@@ -1,5 +1,8 @@
+```marmaid
+
 graph TD
     %% Define Nodes and Styles
+    
     A["1. CLI Entrypoint
     Input: Command Line Args
     Output: Query String (str)"]
@@ -26,3 +29,4 @@ graph TD
     B --> |If Chat or Error| E
     C --> D
     D --> E
+```
