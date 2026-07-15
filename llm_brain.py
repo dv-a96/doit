@@ -2,6 +2,9 @@ import os
 import json
 import re
 import litellm
+import warnings
+# Suppress Pydantic serialization warnings caused by LiteLLM / Gemini tool call formats
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
 # Silencing LiteLLM output and debugging helpers
 litellm.suppress_warnings = True
@@ -180,7 +183,7 @@ Rules:
      "is_destructive": true | false,
      "explanation": "the explanation returned by the safety tool, or empty if not a command"
    }
-4. If the request is impossible, set action_type to 'error' with an explanation, set is_destructive to false, and explanation to empty."""
+4. If the request is impossible, unachievable in a CLI shell, or contains physical actions/nonsense commands (like "jump high", "fly to the moon"), you MUST set action_type to "error" and explain in the content that as an AI CLI assistant you cannot perform physical or impossible tasks."""
 
     messages = [
         {"role": "system", "content": system_prompt},
