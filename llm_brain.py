@@ -161,6 +161,7 @@ def query_llm(user_instruction: str) -> dict:
     else:
         user_instruction = str(user_instruction)
 
+    # Define tools available for the LLM
     tools = [
         {
             "type": "function",
@@ -178,6 +179,30 @@ def query_llm(user_instruction: str) -> dict:
                     "required": ["command"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ask_user_clarification",
+                "description": "Call this tool when you are not sure about the user's intent, when there are multiple logical options, or when critical details are missing. Do not make unsafe assumptions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The clarification question to print to the user. E.g., 'Do you want to sort by:'"
+                        },
+                        "options": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "List of concrete options for the user to choose from (e.g., ['creation date', 'access date']). Leave empty for open-ended questions."
+                        }
+                    },
+                    "required": ["question"]
+                }
+            }
         }
     ]
 
@@ -185,10 +210,10 @@ def query_llm(user_instruction: str) -> dict:
 Analyze the history of previous commands and their execution outputs provided in the message thread to resolve pronouns (like 'them', 'it', 'that') and context-specific adjustments (like 'no, I meant...').
 
 Rules:
-1. If the user wants to run or perform ANY action in the terminal (including printing/echoing text, listing files, deleting, moving, creating, network check), you MUST treat this as a terminal command. For example if the user ask "print hi" you MUST treat it as "echo hi" command.
-   - You MUST call the 'call_safety_check' tool with the exact command before returning the final response.
-2. If the user explicitly asks for a joke, conversational chat, or general AI explanation (not a terminal action), set action_type to 'chat', provide the text in 'content', set is_destructive to false, and explanation to empty.
-3. If you are not calling a tool (or after you receive the tool results), you must ONLY respond with a valid JSON object. Do not include any markdown formatting (NO ```json blocks), no thoughts, and no extra text.
+1. If the user wants to run or perform ANY action in the terminal, you MUST treat this as a terminal command and call 'call_safety_check' with the exact final command before returning.
+2. If you are unsure of the user's intent, face ambiguity (e.g., sorting parameters, selecting between multiple files), or need critical missing information, you MUST call the 'ask_user_clarification' tool. Do not guess or proceed with assumptions when it can lead to undesired or destructive behaviors.
+3. If the user explicitly asks for a joke, conversational chat, or general AI explanation (not a terminal action), set action_type to 'chat', provide the text in 'content', set is_destructive to false, and explanation to empty.
+4. If you are not calling a tool (or after you receive the tool results), you must ONLY respond with a valid JSON object. Do not include any markdown formatting (NO ```json blocks), no thoughts, and no extra text.
    The JSON structure must be:
    {
      "action_type": "command" | "chat" | "error",
@@ -196,40 +221,45 @@ Rules:
      "is_destructive": true | false,
      "explanation": "the explanation returned by the safety tool, or empty if not a command"
    }
-4. If the request is impossible, unachievable in a CLI shell, or contains physical actions/nonsense commands, set action_type to "error" and explain in content."""
+5. If the request is impossible, unachievable in a CLI shell, or contains physical actions/nonsense commands, set action_type to "error" and explain in content."""
 
     # Using the dynamic history messages builder
     messages = build_messages_with_history(system_prompt, user_instruction)
 
     try:
-        response = litellm.completion(
-            model=model,
-            custom_llm_provider=provider,
-            messages=messages,
-            tools=tools,
-            system_instruction=system_prompt,
-            temperature=0.0
-        )
-        
-        message = response.choices[0].message
-        
-        if message.get("tool_calls"):
+        # Loop to process consecutive tool calls (e.g., clarification first, then safety check)
+        while True:
+            response = litellm.completion(
+                model=model,
+                custom_llm_provider=provider,
+                messages=messages,
+                tools=tools,
+                system_instruction=system_prompt,
+                temperature=0.0
+            )
+            
+            message = response.choices[0].message
+            
+            # If no tools are called, break the loop and process the final content
+            if not message.get("tool_calls"):
+                raw_content = message.content
+                break
+                
             tool_call = message["tool_calls"][0]
             tool_name = tool_call.function.name
             tool_args = json.loads(tool_call.function.arguments)
             
+            # Append assistant's tool call message to the thread (required by the API protocol)
+            messages.append(message)
+            
+            tool_result_content = ""
+            
             if tool_name == "call_safety_check":
                 command_to_test = tool_args.get("command")
                 tool_result = _check_command_safety(command_to_test)
+                tool_result_content = json.dumps(tool_result)
                 
-                messages.append(message)
-                messages.append({
-                    "role": "tool",
-                    "name": tool_name,
-                    "tool_call_id": tool_call.id,
-                    "content": json.dumps(tool_result)
-                })
-                
+                # Update system instructions for the follow-up step to strictly enforce JSON output
                 second_turn_prompt = """You are the brain of a CLI agent named 'doit'.
 You have received the safety check result for the command.
 You MUST respond with a valid JSON object. Do not include any markdown formatting, no thoughts, and no extra text.
@@ -242,24 +272,60 @@ The JSON structure must be:
   "explanation": "<the explanation from the safety tool>"
 }"""
                 messages[0]["content"] = second_turn_prompt
+                
+            elif tool_name == "ask_user_clarification":
+                question = tool_args.get("question")
+                options = tool_args.get("options", [])
+                
+                # Prompt the clarification to the user
+                print(f"\n🤔 {question}")
+                if options:
+                    for idx, opt in enumerate(options, start=1):
+                        print(f"{idx}. {opt}")
+                
+                # Wait for user input
+                try:
+                    user_answer = input("\nYour answer (or press Enter to cancel): ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    print("\nOperation cancelled by user.")
+                    return {
+                        "action_type": "error",
+                        "content": "Clarification cancelled by user.",
+                        "is_destructive": False,
+                        "explanation": ""
+                    }
+                
+                # Handle empty input / cancellation
+                if not user_answer:
+                    print("No response provided. Operation cancelled.")
+                    return {
+                        "action_type": "error",
+                        "content": "Operation cancelled due to missing user feedback.",
+                        "is_destructive": False,
+                        "explanation": ""
+                    }
+                
+                # If options are available and user enters a numeric choice, translate it
+                if options and user_answer.isdigit():
+                    choice_idx = int(user_answer) - 1
+                    if 0 <= choice_idx < len(options):
+                        user_answer = options[choice_idx]
+                
+                tool_result_content = json.dumps({"user_response": user_answer})
+            
+            # Send the tool output back to the model context
+            messages.append({
+                "role": "tool",
+                "name": tool_name,
+                "tool_call_id": tool_call.id,
+                "content": tool_result_content
+            })
 
-                second_response = litellm.completion(
-                    model=model,
-                    custom_llm_provider=provider,
-                    messages=messages,
-                    system_instruction=second_turn_prompt,
-                    temperature=0.0
-                )
-                raw_content = second_response.choices[0].message.content
-            else:
-                raw_content = message.content
-        else:
-            raw_content = message.content
-
+        # Process the final JSON response returned after all tool calls have completed
         cleaned_content = clean_json_markdown(raw_content)
         final_response_dict = json.loads(cleaned_content)
         
-        # Saving the new turn to the local history
+        # Saving the new finished turn to local history
         history_manager.add_turn(user_instruction, final_response_dict)
         
         return final_response_dict
