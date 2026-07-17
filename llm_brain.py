@@ -211,7 +211,10 @@ Analyze the history of previous commands and their execution outputs provided in
 
 Rules:
 1. If the user wants to run or perform ANY action in the terminal, you MUST treat this as a terminal command and call 'call_safety_check' with the exact final command before returning.
-2. If you are unsure of the user's intent, face ambiguity (e.g., sorting parameters, selecting between multiple files), or need critical missing information, you MUST call the 'ask_user_clarification' tool. Do not guess or proceed with assumptions when it can lead to undesired or destructive behaviors.
+2. You MUST call the 'ask_user_clarification' tool whenever there is any logical ambiguity or multiple valid ways to interpret a parameter in the user's request. 
+   - For example: if the user asks to sort/filter/find files by "date", "time", or "size" without specifying which exact attribute (e.g., creation date, modification date, access date), you MUST NOT assume a default. You MUST call 'ask_user_clarification' to ask them which one they want.
+   - If the request is generic (e.g., "delete the log file" when there are multiple files with this name in the current directory), you MUST ask for clarification.
+   - Do not guess or proceed with assumptions when it can lead to undesired or destructive behaviors, or when multiple standard alternatives exist.
 3. If the user explicitly asks for a joke, conversational chat, or general AI explanation (not a terminal action), set action_type to 'chat', provide the text in 'content', set is_destructive to false, and explanation to empty.
 4. If you are not calling a tool (or after you receive the tool results), you must ONLY respond with a valid JSON object. Do not include any markdown formatting (NO ```json blocks), no thoughts, and no extra text.
    The JSON structure must be:
@@ -222,7 +225,6 @@ Rules:
      "explanation": "the explanation returned by the safety tool, or empty if not a command"
    }
 5. If the request is impossible, unachievable in a CLI shell, or contains physical actions/nonsense commands, set action_type to "error" and explain in content."""
-
     # Using the dynamic history messages builder
     messages = build_messages_with_history(system_prompt, user_instruction)
 
