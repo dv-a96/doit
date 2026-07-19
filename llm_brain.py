@@ -114,7 +114,7 @@ Only 'read-only' commands are safe (is_destructive: false). Anything that writes
 def build_messages_with_history(system_prompt: str, user_instruction: str) -> list:
     """
     Combines system prompt, saved history turns, and the current user instruction
-    into a structured list of messages for the LLM.
+    into a structured list of messages for the LLM, properly formatting past tool calls.
     """
     turns = history_manager.get_all_turns()
     messages = [{"role": "system", "content": system_prompt}]
@@ -123,11 +123,30 @@ def build_messages_with_history(system_prompt: str, user_instruction: str) -> li
         # 1. Add user's original request
         messages.append({"role": "user", "content": turn["user_instruction"]})
         
-        # 2. Add assistant's JSON response (as a string)
-        assistant_json_str = json.dumps(turn["assistant_response"])
-        messages.append({"role": "assistant", "content": assistant_json_str})
+        # 2. Reconstruct past clarification tool interactions if they exist
+        assistant_resp = turn["assistant_response"]
+        if "clarification_history" in assistant_resp:
+            for item in assistant_resp["clarification_history"]:
+                # Append the simulated assistant tool call
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [item["tool_call"]]
+                })
+                # Append the simulated user response as tool output
+                messages.append({
+                    "role": "tool",
+                    "name": "ask_user_clarification",
+                    "tool_call_id": item["tool_call"]["id"],
+                    "content": json.dumps({"user_response": item["user_response"]})
+                })
         
-        # 3. Add execution output feedback (if exists)
+        # 3. Add assistant's final JSON response (as a string)
+        # Remove the internal history key before sending to LLM to keep context clean
+        clean_assistant_resp = {k: v for k, v in assistant_resp.items() if k != "clarification_history"}
+        messages.append({"role": "assistant", "content": json.dumps(clean_assistant_resp)})
+        
+        # 4. Add execution output feedback (if exists)
         exec_res = turn.get("execution_result")
         if exec_res:
             feedback = (
@@ -161,6 +180,9 @@ def query_llm(user_instruction: str) -> dict:
     else:
         user_instruction = str(user_instruction)
 
+    # Internal list to collect clarification steps for history persistence
+    clarification_history = []
+
     # Define tools available for the LLM
     tools = [
         {
@@ -173,7 +195,7 @@ def query_llm(user_instruction: str) -> dict:
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "The exact bash command to be executed (e.g. 'ls -la' or 'rm -rf files')"
+                            "description": "The exact bash command to be executed"
                         }
                     },
                     "required": ["command"]
@@ -197,7 +219,7 @@ def query_llm(user_instruction: str) -> dict:
                             "items": {
                                 "type": "string"
                             },
-                            "description": "List of concrete options for the user to choose from (e.g., ['creation date', 'access date']). Leave empty for open-ended questions."
+                            "description": "List of concrete options for the user to choose from. Leave empty for open-ended questions."
                         }
                     },
                     "required": ["question"]
@@ -207,29 +229,28 @@ def query_llm(user_instruction: str) -> dict:
     ]
 
     system_prompt = """You are the brain of a CLI agent named 'doit'. You support multi-turn conversations.
-Analyze the history of previous commands and their execution outputs provided in the message thread to resolve pronouns (like 'them', 'it', 'that') and context-specific adjustments (like 'no, I meant...').
+    Analyze the history of previous commands and their execution outputs provided in the message thread to resolve pronouns (like 'them', 'it', 'that') and context-specific adjustments (like 'no, I meant...').
 
-Rules:
-1. If the user wants to run or perform ANY action in the terminal, you MUST treat this as a terminal command and call 'call_safety_check' with the exact final command before returning.
-2. You MUST call the 'ask_user_clarification' tool whenever there is any logical ambiguity or multiple valid ways to interpret a parameter in the user's request. 
-   - For example: if the user asks to sort/filter/find files by "date", "time", or "size" without specifying which exact attribute (e.g., creation date, modification date, access date), you MUST NOT assume a default. You MUST call 'ask_user_clarification' to ask them which one they want.
-   - If the request is generic (e.g., "delete the log file" when there are multiple files with this name in the current directory), you MUST ask for clarification.
-   - Do not guess or proceed with assumptions when it can lead to undesired or destructive behaviors, or when multiple standard alternatives exist.
-3. If the user explicitly asks for a joke, conversational chat, or general AI explanation (not a terminal action), set action_type to 'chat', provide the text in 'content', set is_destructive to false, and explanation to empty.
-4. If you are not calling a tool (or after you receive the tool results), you must ONLY respond with a valid JSON object. Do not include any markdown formatting (NO ```json blocks), no thoughts, and no extra text.
-   The JSON structure must be:
-   {
-     "action_type": "command" | "chat" | "error",
-     "content": "the bash command OR the text reply/joke OR the error explanation",
-     "is_destructive": true | false,
-     "explanation": "the explanation returned by the safety tool, or empty if not a command"
-   }
-5. If the request is impossible, unachievable in a CLI shell, or contains physical actions/nonsense commands, set action_type to "error" and explain in content."""
-    # Using the dynamic history messages builder
+    Rules:
+    1. If the user wants to run or perform ANY action in the terminal, you MUST treat this as a terminal command and call 'call_safety_check' with the exact final command before returning.
+    2. You MUST call the 'ask_user_clarification' tool whenever there is any logical ambiguity or multiple valid ways to interpret a parameter in the user's request. 
+    - For example: if the user asks to sort/filter/find files by "date", "time", or "size" without specifying which exact attribute (e.g., creation date, modification date, access date), you MUST NOT assume a default. You MUST call 'ask_user_clarification' to ask them which one they want.
+    - If the request is generic (e.g., "delete the log file" when there are multiple files with this name in the current directory), you MUST ask for clarification.
+    - Do not guess or proceed with assumptions when it can lead to undesired or destructive behaviors, or when multiple standard alternatives exist.
+    3. If the user explicitly asks for a joke, conversational chat, or general AI explanation (not a terminal action), set action_type to 'chat', provide the text in 'content', set is_destructive to false, and explanation to empty.
+    4. If you are not calling a tool (or after you receive the tool results), you must ONLY respond with a valid JSON object. Do not include any markdown formatting (NO ```json blocks), no thoughts, and no extra text.
+    The JSON structure must be:
+    {
+        "action_type": "command" | "chat" | "error",
+        "content": "the bash command OR the text reply/joke OR the error explanation",
+        "is_destructive": true | false,
+        "explanation": "the explanation returned by the safety tool, or empty if not a command"
+    }
+    5. If the request is impossible, unachievable in a CLI shell, or contains physical actions/nonsense commands, set action_type to "error" and explain in content."""
+
     messages = build_messages_with_history(system_prompt, user_instruction)
 
     try:
-        # Loop to process consecutive tool calls (e.g., clarification first, then safety check)
         while True:
             response = litellm.completion(
                 model=model,
@@ -242,7 +263,6 @@ Rules:
             
             message = response.choices[0].message
             
-            # If no tools are called, break the loop and process the final content
             if not message.get("tool_calls"):
                 raw_content = message.content
                 break
@@ -251,9 +271,7 @@ Rules:
             tool_name = tool_call.function.name
             tool_args = json.loads(tool_call.function.arguments)
             
-            # Append assistant's tool call message to the thread (required by the API protocol)
             messages.append(message)
-            
             tool_result_content = ""
             
             if tool_name == "call_safety_check":
@@ -261,61 +279,44 @@ Rules:
                 tool_result = _check_command_safety(command_to_test)
                 tool_result_content = json.dumps(tool_result)
                 
-                # Update system instructions for the follow-up step to strictly enforce JSON output
                 second_turn_prompt = """You are the brain of a CLI agent named 'doit'.
 You have received the safety check result for the command.
 You MUST respond with a valid JSON object. Do not include any markdown formatting, no thoughts, and no extra text.
-You MUST output a JSON response of action_type "command" containing the exact command in "content", and the tool's returned "is_destructive" and "explanation" values.
-The JSON structure must be:
-{
-  "action_type": "command",
-  "content": "<the exact command that was tested>",
-  "is_destructive": true | false,
-  "explanation": "<the explanation from the safety tool>"
-}"""
+You MUST output a JSON response of action_type "command" containing the exact command in "content", and the tool's returned "is_destructive" and "explanation" values."""
                 messages[0]["content"] = second_turn_prompt
                 
             elif tool_name == "ask_user_clarification":
                 question = tool_args.get("question")
                 options = tool_args.get("options", [])
                 
-                # Prompt the clarification to the user
                 print(f"\n🤔 {question}")
                 if options:
                     for idx, opt in enumerate(options, start=1):
                         print(f"{idx}. {opt}")
                 
-                # Wait for user input
                 try:
                     user_answer = input("\nYour answer (or press Enter to cancel): ").strip()
                 except (KeyboardInterrupt, EOFError):
                     print("\nOperation cancelled by user.")
-                    return {
-                        "action_type": "error",
-                        "content": "Clarification cancelled by user.",
-                        "is_destructive": False,
-                        "explanation": ""
-                    }
+                    return {"action_type": "error", "content": "Cancelled", "is_destructive": False, "explanation": ""}
                 
-                # Handle empty input / cancellation
                 if not user_answer:
-                    print("No response provided. Operation cancelled.")
-                    return {
-                        "action_type": "error",
-                        "content": "Operation cancelled due to missing user feedback.",
-                        "is_destructive": False,
-                        "explanation": ""
-                    }
+                    print("Operation cancelled.")
+                    return {"action_type": "error", "content": "Cancelled", "is_destructive": False, "explanation": ""}
                 
-                # If options are available and user enters a numeric choice, translate it
                 if options and user_answer.isdigit():
                     choice_idx = int(user_answer) - 1
                     if 0 <= choice_idx < len(options):
                         user_answer = options[choice_idx]
                 
+                # Capture the exact tool_call structure and the user's answer for structural history saving
+                clarification_history.append({
+                    "tool_call": dict(tool_call),
+                    "user_response": user_answer
+                })
+                
                 tool_result_content = json.dumps({"user_response": user_answer})
             
-            # Send the tool output back to the model context
             messages.append({
                 "role": "tool",
                 "name": tool_name,
@@ -323,11 +324,14 @@ The JSON structure must be:
                 "content": tool_result_content
             })
 
-        # Process the final JSON response returned after all tool calls have completed
         cleaned_content = clean_json_markdown(raw_content)
         final_response_dict = json.loads(cleaned_content)
         
-        # Saving the new finished turn to local history
+        # Embed the structural clarification history inside the final response dict before saving
+        if clarification_history:
+            final_response_dict["clarification_history"] = clarification_history
+        
+        # Save to history file
         history_manager.add_turn(user_instruction, final_response_dict)
         
         return final_response_dict
