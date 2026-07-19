@@ -127,17 +127,24 @@ def build_messages_with_history(system_prompt: str, user_instruction: str) -> li
         assistant_resp = turn["assistant_response"]
         if "clarification_history" in assistant_resp:
             for item in assistant_resp["clarification_history"]:
-                # Append the simulated assistant tool call
+                # Reconstruct a clean, API-compliant tool call dictionary structure
                 messages.append({
                     "role": "assistant",
                     "content": None,
-                    "tool_calls": [item["tool_call"]]
+                    "tool_calls": [{
+                        "id": item["tool_call_id"],
+                        "type": "function",
+                        "function": {
+                            "name": "ask_user_clarification",
+                            "arguments": json.dumps(item["arguments"])
+                        }
+                    }]
                 })
                 # Append the simulated user response as tool output
                 messages.append({
                     "role": "tool",
                     "name": "ask_user_clarification",
-                    "tool_call_id": item["tool_call"]["id"],
+                    "tool_call_id": item["tool_call_id"],
                     "content": json.dumps({"user_response": item["user_response"]})
                 })
         
@@ -206,47 +213,46 @@ def query_llm(user_instruction: str) -> dict:
             "type": "function",
             "function": {
                 "name": "ask_user_clarification",
-                "description": "Call this tool when you are not sure about the user's intent, when there are multiple logical options, or when critical details are missing. Do not make unsafe assumptions.",
+                "description": "Call this tool when you are not sure about the user's intent, when there are multiple logical options, or when critical details are missing. You MUST provide explicit, numbered choices for the user.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "question": {
                             "type": "string",
-                            "description": "The clarification question to print to the user. E.g., 'Do you want to sort by:'"
+                            "description": "The clarification question context to print to the user. E.g., 'Do you want to sort by:'"
                         },
                         "options": {
                             "type": "array",
                             "items": {
                                 "type": "string"
                             },
-                            "description": "List of concrete options for the user to choose from. Leave empty for open-ended questions."
+                            "description": "A list of explicit options the user can choose from. You MUST provide at least 2 distinct, actionable options representing the possible interpretations. Do not leave this empty."
                         }
                     },
-                    "required": ["question"]
+                    "required": ["question", "options"]
                 }
             }
         }
     ]
 
     system_prompt = """You are the brain of a CLI agent named 'doit'. You support multi-turn conversations.
-    Analyze the history of previous commands and their execution outputs provided in the message thread to resolve pronouns (like 'them', 'it', 'that') and context-specific adjustments (like 'no, I meant...').
+Analyze the history of previous commands, past choices, and their execution outputs provided in the message thread to resolve pronouns and context-specific locations.
 
-    Rules:
-    1. If the user wants to run or perform ANY action in the terminal, you MUST treat this as a terminal command and call 'call_safety_check' with the exact final command before returning.
-    2. You MUST call the 'ask_user_clarification' tool whenever there is any logical ambiguity or multiple valid ways to interpret a parameter in the user's request. 
-    - For example: if the user asks to sort/filter/find files by "date", "time", or "size" without specifying which exact attribute (e.g., creation date, modification date, access date), you MUST NOT assume a default. You MUST call 'ask_user_clarification' to ask them which one they want.
-    - If the request is generic (e.g., "delete the log file" when there are multiple files with this name in the current directory), you MUST ask for clarification.
-    - Do not guess or proceed with assumptions when it can lead to undesired or destructive behaviors, or when multiple standard alternatives exist.
-    3. If the user explicitly asks for a joke, conversational chat, or general AI explanation (not a terminal action), set action_type to 'chat', provide the text in 'content', set is_destructive to false, and explanation to empty.
-    4. If you are not calling a tool (or after you receive the tool results), you must ONLY respond with a valid JSON object. Do not include any markdown formatting (NO ```json blocks), no thoughts, and no extra text.
-    The JSON structure must be:
-    {
-        "action_type": "command" | "chat" | "error",
-        "content": "the bash command OR the text reply/joke OR the error explanation",
-        "is_destructive": true | false,
-        "explanation": "the explanation returned by the safety tool, or empty if not a command"
-    }
-    5. If the request is impossible, unachievable in a CLI shell, or contains physical actions/nonsense commands, set action_type to "error" and explain in content."""
+Rules:
+1. If the user wants to run or perform ANY action in the terminal, you MUST treat this as a terminal command and call 'call_safety_check' with the exact final command before returning.
+2. You MUST call the 'ask_user_clarification' tool whenever there is any logical ambiguity or multiple valid ways to interpret a parameter in the user's request. 
+   - For example: if the user asks to sort/filter/find files by "date", "time", or "size" without specifying which exact attribute (e.g., creation date, modification date, access date), you MUST NOT assume a default. You MUST call 'ask_user_clarification' to ask them which one they want.
+   - If the request is generic (e.g., "delete the log file" when there are multiple files with this name, or "show content of the file" when the specific file path or target was established in a past clarification turn), you MUST analyze history to use the correct path or ask for clarification.
+3. If the user explicitly asks for a joke, conversational chat, or general AI explanation (not a terminal action), set action_type to 'chat', provide the text in 'content', set is_destructive to false, and explanation to empty.
+4. If you are not calling a tool (or after you receive the tool results), you must ONLY respond with a valid JSON object. Do not include any markdown formatting (NO ```json blocks), no thoughts, and no extra text.
+   The JSON structure must be:
+   {
+     "action_type": "command" | "chat" | "error",
+     "content": "the bash command OR the text reply/joke OR the error explanation",
+     "is_destructive": true | false,
+     "explanation": "the explanation returned by the safety tool, or empty if not a command"
+   }
+5. If the request is impossible, unachievable in a CLI shell, or contains physical actions/nonsense commands, set action_type to "error" and explain in content."""
 
     messages = build_messages_with_history(system_prompt, user_instruction)
 
@@ -309,9 +315,10 @@ You MUST output a JSON response of action_type "command" containing the exact co
                     if 0 <= choice_idx < len(options):
                         user_answer = options[choice_idx]
                 
-                # Capture the exact tool_call structure and the user's answer for structural history saving
+                # Safely capture ONLY primitive properties from the tool call to ensure valid JSON serialization
                 clarification_history.append({
-                    "tool_call": dict(tool_call),
+                    "tool_call_id": tool_call.id,
+                    "arguments": tool_args,
                     "user_response": user_answer
                 })
                 
