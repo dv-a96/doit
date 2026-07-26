@@ -257,7 +257,7 @@ STRICT RULES:
      b) Once clarified, set action_type to "chat" and provide focused explanation in 'content'.
 
 3. COMMAND EXECUTION REQUESTS & FOLLOW-UPS:
-   - If the user explicitly asks to RUN or EXECUTE a terminal action:
+   - If the user asks to navigate, change directory, or run ANY action in the terminal (e.g., 'move to home dir', 'go to project'), you MUST treat this as a terminal command (e.g., cd ~) and set action_type to 'command'.":
      a) Set action_type to "command", call 'call_safety_check' on the exact final bash command, and return the JSON.
 
 4. PATH RESOLUTION:

@@ -120,9 +120,29 @@ def main():
                     "returncode": 0
                 })
                 
-                # 3. Replace current process with a new interactive shell at the new path
+                # 3. Preserve active environment safely across subshells
                 user_shell = os.environ.get("SHELL", "/bin/bash")
-                os.execl(user_shell, user_shell)
+                conda_env = os.environ.get("CONDA_DEFAULT_ENV")
+                venv_path = os.environ.get("VIRTUAL_ENV")
+
+                # If running inside a non-base Conda environment (e.g. 'llm')
+                if conda_env and conda_env != "base":
+                    import tempfile
+                    # Create a temporary rcfile that loads ~/.bashrc and re-activates the conda env
+                    tmp_rc = tempfile.NamedTemporaryFile("w", delete=False, suffix="_rc")
+                    tmp_rc.write(f'source ~/.bashrc 2>/dev/null\nconda activate "{conda_env}" 2>/dev/null\nrm -f "{tmp_rc.name}"\n')
+                    tmp_rc.close()
+                    
+                    os.execl(user_shell, user_shell, "--rcfile", tmp_rc.name, "-i")
+                elif venv_path:
+                    import tempfile
+                    tmp_rc = tempfile.NamedTemporaryFile("w", delete=False, suffix="_rc")
+                    tmp_rc.write(f'source ~/.bashrc 2>/dev/null\nsource "{venv_path}/bin/activate" 2>/dev/null\nrm -f "{tmp_rc.name}"\n')
+                    tmp_rc.close()
+                    
+                    os.execl(user_shell, user_shell, "--rcfile", tmp_rc.name, "-i")
+                else:
+                    os.execl(user_shell, user_shell, "-i")
                 
             except Exception as e:
                 error_msg = f"cd: {target_dir}: No such file or directory\n"
@@ -133,7 +153,7 @@ def main():
                     "returncode": 1
                 })
             return
-        
+            
         # Execute the final authorized command
         execution_result = run_shell(content)
         
