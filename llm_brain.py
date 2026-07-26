@@ -154,14 +154,18 @@ def build_messages_with_history(system_prompt: str, user_instruction: str) -> li
         clean_assistant_resp = {k: v for k, v in assistant_resp.items() if k != "clarification_history"}
         messages.append({"role": "assistant", "content": json.dumps(clean_assistant_resp)})
         
-        # 4. Add execution output feedback (if exists)
+       # 4. Add execution output feedback (if exists)
         exec_res = turn.get("execution_result")
         if exec_res:
+            # We format stdout/stderr strictly to avoid the LLM confusing new user prompts with command errors
+            stdout_clean = exec_res.get('stdout', '').strip() or "None"
+            stderr_clean = exec_res.get('stderr', '').strip() or "None"
+            
             feedback = (
-                f"System execution output of the command was:\n"
-                f"Exit Code: {exec_res.get('returncode')}\n"
-                f"STDOUT: {exec_res.get('stdout', '').strip()}\n"
-                f"STDERR: {exec_res.get('stderr', '').strip()}"
+                f"[PREVIOUS COMMAND EXECUTION RESULT]\n"
+                f"- Return Code: {exec_res.get('returncode')}\n"
+                f"- Standard Output (STDOUT): {stdout_clean}\n"
+                f"- Standard Error (STDERR): {stderr_clean}"
             )
             messages.append({
                 "role": "user", 
