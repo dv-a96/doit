@@ -6,6 +6,7 @@ import litellm
 import warnings
 import history_manager
 import memory_manager
+import shell_history_manager
 
 # Suppress Pydantic serialization warnings caused by LiteLLM / Gemini tool call formats
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
@@ -128,7 +129,6 @@ def build_messages_with_history(system_prompt: str, user_instruction: str) -> li
         assistant_resp = turn["assistant_response"]
         if "clarification_history" in assistant_resp:
             for item in assistant_resp["clarification_history"]:
-                # Reconstruct a clean, API-compliant tool call dictionary structure
                 messages.append({
                     "role": "assistant",
                     "content": None,
@@ -141,7 +141,6 @@ def build_messages_with_history(system_prompt: str, user_instruction: str) -> li
                         }
                     }]
                 })
-                # Append the simulated user response as tool output
                 messages.append({
                     "role": "tool",
                     "name": "ask_user_clarification",
@@ -150,14 +149,12 @@ def build_messages_with_history(system_prompt: str, user_instruction: str) -> li
                 })
         
         # 3. Add assistant's final JSON response (as a string)
-        # Remove the internal history key before sending to LLM to keep context clean
         clean_assistant_resp = {k: v for k, v in assistant_resp.items() if k != "clarification_history"}
         messages.append({"role": "assistant", "content": json.dumps(clean_assistant_resp)})
         
-       # 4. Add execution output feedback (if exists)
+        # 4. Add execution output feedback (if exists)
         exec_res = turn.get("execution_result")
         if exec_res:
-            # We format stdout/stderr strictly to avoid the LLM confusing new user prompts with command errors
             stdout_clean = exec_res.get('stdout', '').strip() or "None"
             stderr_clean = exec_res.get('stderr', '').strip() or "None"
             
@@ -172,13 +169,13 @@ def build_messages_with_history(system_prompt: str, user_instruction: str) -> li
                 "content": feedback
             })
             
-    # Finally, append the current user instruction
+    # Append current instruction
     messages.append({"role": "user", "content": user_instruction})
     return messages
 
 
 def query_llm(user_instruction: str) -> dict:
-    """Send the request to the LLM including multi-turn history context."""
+    """Send the request to the LLM including multi-turn history, user memories, and live shell activity."""
     config = load_config()
     model = config["model"]
     provider = config["provider"]
@@ -195,8 +192,12 @@ def query_llm(user_instruction: str) -> dict:
     # Internal list to collect clarification steps for history persistence
     clarification_history = []
 
-    # Load formatted active memories to inject into System Prompt
+    # Load formatted active memories
     memories_context = memory_manager.get_formatted_memories(user_instruction)
+
+    # Fetch live current working directory and merged timeline (Shell + Agent)
+    current_pwd = os.getcwd()
+    shell_timeline = shell_history_manager.get_combined_timeline(limit=15)
 
     # Define tools available for the LLM
     tools = [
@@ -234,7 +235,7 @@ def query_llm(user_instruction: str) -> dict:
                             "items": {
                                 "type": "string"
                             },
-                            "description": "A list of explicit options the user can choose from. You MUST provide at least 2 distinct, actionable options representing the possible interpretations. Do not leave this empty."
+                            "description": "A list of explicit options the user can choose from."
                         }
                     },
                     "required": ["question", "options"]
@@ -243,31 +244,41 @@ def query_llm(user_instruction: str) -> dict:
         }
     ]
 
-    system_prompt = f"""You are the brain of a CLI agent named 'doit'. You support multi-turn conversations and rich interactions.
-Analyze interaction history and stored persistent user memories to resolve contexts, paths, and preferences.
+    system_prompt = f"""You are the brain of a CLI agent named 'doit'. You support multi-turn conversations, rich interactions, and full user terminal awareness.
+Analyze interaction history, live shell timeline, and persistent user memories to resolve contexts, paths, and preferences.
+
+CURRENT TERMINAL STATE:
+- Working Directory (PWD): {current_pwd}
+
+RECENT TERMINAL ACTIVITY (USER & AGENT TIMELINE):
+{shell_timeline}
 
 PERSISTENT USER MEMORIES:
 {memories_context}
 
 STRICT RULES:
 
-1. MEMORY AWARENESS:
-   - Use the PERSISTENT USER MEMORIES list above to resolve shortcuts, project locations, or user preferences (e.g., if memory says "LLM project is ~/school/llms/ass3", use that exact path when asked to navigate or act on it).
+1. USER & TERMINAL AWARENESS:
+   - You are fully aware of the current working directory ({current_pwd}) and recent shell history.
+   - Distinguish between actions manually run by [USER] and actions run by [AGENT (doit)].
+   - Use the recent terminal activity to understand context (e.g., if user manually ran 'cd ...' or 'mkdir ...', use that context when asked instructions like "summarize what I just did").
 
-2. NON-COMMANDS / EXPLANATIONAL REQUESTS:
-   - If the user asks "how to...", "how do I...", "explain...", or asks for information/options without explicitly demanding execution:
-     a) If the request is GENERAL or AMBIGUOUS with multiple distinct formats/methods:
-        YOU MUST CALL 'ask_user_clarification' FIRST.
-     b) Once clarified, set action_type to "chat" and provide focused explanation in 'content'.
+2. MEMORY AWARENESS:
+   - Use the PERSISTENT USER MEMORIES list above to resolve shortcuts, project locations, or user preferences.
 
-3. COMMAND EXECUTION REQUESTS & FOLLOW-UPS:
-   - If the user asks to navigate, change directory, or run ANY action in the terminal (e.g., 'move to home dir', 'go to project'), you MUST treat this as a terminal command (e.g., cd ~) and set action_type to 'command'.":
+3. NON-COMMANDS / EXPLANATIONAL REQUESTS:
+   - If the user asks "how to...", "how do I...", "explain...", "summarize...", or asks for information without explicitly demanding execution:
+     a) If the request is GENERAL or AMBIGUOUS with multiple distinct formats/methods: YOU MUST CALL 'ask_user_clarification' FIRST.
+     b) Once clear, set action_type to "chat" and provide focused explanation in 'content'.
+
+4. COMMAND EXECUTION REQUESTS & FOLLOW-UPS:
+   - If the user asks to navigate, change directory, or run ANY action in the terminal (e.g., 'move to home dir', 'go to project', 'make a new folder'), you MUST treat this as a terminal command and set action_type to 'command':
      a) Set action_type to "command", call 'call_safety_check' on the exact final bash command, and return the JSON.
 
-4. PATH RESOLUTION:
-   - Always use full or explicit paths based on memories or history.
+5. PATH RESOLUTION:
+   - Always use full or explicit paths based on memories, current PWD ({current_pwd}), or history.
 
-5. OUTPUT FORMAT:
+6. OUTPUT FORMAT:
    - Respond ONLY with valid JSON (NO markdown/code blocks):
    {{
      "action_type": "command" | "chat" | "error",
@@ -275,6 +286,7 @@ STRICT RULES:
      "is_destructive": true | false,
      "explanation": "the explanation returned by the safety tool, or empty if not a command"
    }}"""
+
     messages = build_messages_with_history(system_prompt, user_instruction)
 
     try:
@@ -336,7 +348,6 @@ You MUST output a JSON response of action_type "command" containing the exact co
                     if 0 <= choice_idx < len(options):
                         user_answer = options[choice_idx]
                 
-                # Safely capture ONLY primitive properties from the tool call to ensure valid JSON serialization
                 clarification_history.append({
                     "tool_call_id": tool_call.id,
                     "arguments": tool_args,
@@ -355,7 +366,6 @@ You MUST output a JSON response of action_type "command" containing the exact co
         cleaned_content = clean_json_markdown(raw_content)
         final_response_dict = json.loads(cleaned_content)
         
-        # Embed the structural clarification history inside the final response dict before saving
         if clarification_history:
             final_response_dict["clarification_history"] = clarification_history
         
