@@ -5,6 +5,7 @@ import re
 import litellm
 import warnings
 import history_manager
+import memory_manager
 
 # Suppress Pydantic serialization warnings caused by LiteLLM / Gemini tool call formats
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
@@ -190,6 +191,9 @@ def query_llm(user_instruction: str) -> dict:
     # Internal list to collect clarification steps for history persistence
     clarification_history = []
 
+    # Load formatted active memories to inject into System Prompt
+    memories_context = memory_manager.get_formatted_memories(user_instruction)
+
     # Define tools available for the LLM
     tools = [
         {
@@ -235,34 +239,38 @@ def query_llm(user_instruction: str) -> dict:
         }
     ]
 
-    system_prompt = """You are the brain of a CLI agent named 'doit'. You support multi-turn conversations and rich interactions.
-Analyze the history of previous interactions, command outputs, explanations, and clarification steps to resolve context, pronouns, and references.
+    system_prompt = f"""You are the brain of a CLI agent named 'doit'. You support multi-turn conversations and rich interactions.
+Analyze interaction history and stored persistent user memories to resolve contexts, paths, and preferences.
+
+PERSISTENT USER MEMORIES:
+{memories_context}
 
 STRICT RULES:
 
-1. NON-COMMANDS / EXPLANATIONAL REQUESTS:
+1. MEMORY AWARENESS:
+   - Use the PERSISTENT USER MEMORIES list above to resolve shortcuts, project locations, or user preferences (e.g., if memory says "LLM project is ~/school/llms/ass3", use that exact path when asked to navigate or act on it).
+
+2. NON-COMMANDS / EXPLANATIONAL REQUESTS:
    - If the user asks "how to...", "how do I...", "explain...", or asks for information/options without explicitly demanding execution:
-     a) If the request is GENERAL or AMBIGUOUS with multiple distinct formats/methods (e.g., "how do I extract a compressed file?", "how to sort files by date?"):
-        YOU MUST CALL 'ask_user_clarification' FIRST to ask the user which format/method they want to learn about. DO NOT output a long list of all methods in plain text!
-     b) Once clarified (or if the question is completely specific), set action_type to "chat" and provide the focused explanation in 'content'.
-   - NEVER call 'call_safety_check' when producing a "chat" response.
+     a) If the request is GENERAL or AMBIGUOUS with multiple distinct formats/methods:
+        YOU MUST CALL 'ask_user_clarification' FIRST.
+     b) Once clarified, set action_type to "chat" and provide focused explanation in 'content'.
 
-2. COMMAND EXECUTION REQUESTS & FOLLOW-UPS:
-   - If the user explicitly asks to RUN or EXECUTE a terminal action (e.g., "delete x", "execute it", "run this command"):
-     a) If the follow-up refers to a previous 'chat' response that contained MULTIPLE options, YOU MUST CALL 'ask_user_clarification' to ask which option to run.
-     b) Once specified, set action_type to "command", call 'call_safety_check' on the exact final bash command, and return the JSON.
+3. COMMAND EXECUTION REQUESTS & FOLLOW-UPS:
+   - If the user explicitly asks to RUN or EXECUTE a terminal action:
+     a) Set action_type to "command", call 'call_safety_check' on the exact final bash command, and return the JSON.
 
-3. PATH RESOLUTION:
-   - Always use full or explicit paths when constructing commands based on history.
+4. PATH RESOLUTION:
+   - Always use full or explicit paths based on memories or history.
 
-4. OUTPUT FORMAT:
-   - When not calling a tool, respond ONLY with valid JSON (NO markdown/code blocks):
-   {
+5. OUTPUT FORMAT:
+   - Respond ONLY with valid JSON (NO markdown/code blocks):
+   {{
      "action_type": "command" | "chat" | "error",
      "content": "the bash command OR the text explanation/answer OR the error message",
      "is_destructive": true | false,
      "explanation": "the explanation returned by the safety tool, or empty if not a command"
-   }"""
+   }}"""
     messages = build_messages_with_history(system_prompt, user_instruction)
 
     try:

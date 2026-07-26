@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import subprocess
+import threading
 import history_manager
+import memory_agent
 from llm_brain import query_llm
+import os
 
 def run_shell(command: str, shell: str = "/bin/bash"):
     """
@@ -50,6 +53,14 @@ def main():
 
     # Join remainder list arguments to construct the full string
     user_instruction = " ".join(args.instruction) if isinstance(args.instruction, list) else args.instruction
+
+    # 🧠 Launch background memory agent in a separate non-blocking thread
+    memory_thread = threading.Thread(
+        target=memory_agent.process_memory_in_background,
+        args=(user_instruction,),
+        daemon=True
+    )
+    memory_thread.start()
     
     # Query LLM (the turn is automatically appended to local history during the query)
     ai_response = query_llm(user_instruction)
@@ -89,6 +100,39 @@ def main():
         
         # Print the exact command to be executed first
         print(content)
+
+        # SPECIAL HANDLING FOR 'cd' COMMANDS:
+        # Subprocesses cannot modify the parent terminal's working directory.
+        # If the command is a directory change, we change directory in Python and launch an interactive shell.
+        if content.strip().startswith("cd ") or content.strip() == "cd":
+            # Extract target path (defaulting to HOME directory if bare 'cd')
+            raw_path = content.strip()[3:].strip()
+            target_dir = os.path.expanduser(raw_path) if raw_path else os.path.expanduser("~")
+            
+            try:
+                # 1. Change the working directory of the current process
+                os.chdir(target_dir)
+                
+                # 2. Record execution status in history
+                history_manager.update_last_turn_execution({
+                    "stdout": f"Changed directory to {os.getcwd()}\n",
+                    "stderr": "",
+                    "returncode": 0
+                })
+                
+                # 3. Replace current process with a new interactive shell at the new path
+                user_shell = os.environ.get("SHELL", "/bin/bash")
+                os.execl(user_shell, user_shell)
+                
+            except Exception as e:
+                error_msg = f"cd: {target_dir}: No such file or directory\n"
+                print(error_msg, end="")
+                history_manager.update_last_turn_execution({
+                    "stdout": "",
+                    "stderr": error_msg,
+                    "returncode": 1
+                })
+            return
         
         # Execute the final authorized command
         execution_result = run_shell(content)
