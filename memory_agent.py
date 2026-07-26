@@ -16,24 +16,24 @@ def process_memory_in_background(user_instruction: str):
         model = config["model"]
         provider = config["provider"]
 
-        system_prompt = f"""You are a dedicated Background Memory Agent for a CLI tool named 'doit'.
-Your ONLY task is to extract persistent user facts, project path mappings, or user preferences, and maintain a clean memory store.
+        system_prompt = """You are a dedicated Background Memory Agent for a CLI tool named 'doit'.
+Your ONLY task is to extract persistent user facts, personal context (e.g., family events, user details, preferences), project path mappings, or terminal instructions to remember.
 
 CURRENT EXISTING MEMORIES:
 {existing_memories}
 
 INSTRUCTIONS:
 1. Analyze the user's input.
-2. Determine if the user is stating a long-term fact/preference (e.g., "this is my project folder", "remember that X is Y", "always ask me before deleting"), OR updating/invalidating an existing memory.
-3. DO NOT store temporary commands, status checks, or ephemeral requests (e.g., "list files", "show status").
+2. Determine if the user is stating ANY long-term fact, personal information, event context (e.g., "my mom is turning 50 in a week", "my name is John", "this is my project folder"), OR updating/invalidating an existing memory.
+3. DO NOT store routine CLI commands or standard status checks (e.g., "list files", "show status").
 
 Output MUST be a single valid JSON object (no markdown):
-{{
+{
   "has_memory_action": true | false,
   "action": "add" | "delete" | "update" | "none",
   "memory_id_to_remove": "ID of memory if updating/deleting, else null",
-  "new_fact_to_save": "Clear, concise sentence stating the new fact to remember, else null"
-}}"""
+  "new_fact_to_save": "Clear, concise sentence stating the fact to remember, else null"
+}"""
 
         response = litellm.completion(
             model=model,
