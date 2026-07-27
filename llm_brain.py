@@ -3,6 +3,7 @@ import os
 import json
 import re
 import litellm
+import logging
 import warnings
 import history_manager
 import memory_manager
@@ -10,11 +11,14 @@ import shell_history_manager
 
 # Suppress Pydantic serialization warnings caused by LiteLLM / Gemini tool call formats
 warnings.filterwarnings("ignore")
-
+# Silence LiteLLM specific internal loggers
+logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+logging.getLogger("LiteLLM Router").setLevel(logging.ERROR)
+logging.getLogger("LiteLLM Proxy").setLevel(logging.ERROR)
 # Silencing LiteLLM output and debugging helpers
-litellm.suppress_warnings = True
 os.environ["LITELLM_LOG"] = "ERROR"
 os.environ["LITELLM_SUPPRESS_LOGGING"] = "YES"
+litellm.suppress_warnings = True
 
 def load_config() -> dict:
     """Load configuration from ~/doit.cfg."""
