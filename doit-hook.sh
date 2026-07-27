@@ -2,6 +2,8 @@
 
 # Path to the shell execution log file
 DOIT_SHELL_LOG="$HOME/.doit/shell_history.log"
+MAX_LOG_LINES=500
+TRIM_TO_LINES=200
 mkdir -p "$HOME/.doit"
 
 _doit_log_command() {
@@ -9,7 +11,7 @@ _doit_log_command() {
     local LAST_CMD
     LAST_CMD=$(fc -ln -1 2>/dev/null | sed 's/^[[:space:]]*//')
 
-    # Skip logging if the command is empty or starts with 'doit' (to prevent duplicates)
+    # Skip logging if the command is empty or starts with 'doit'
     if [[ -z "$LAST_CMD" ]] || [[ "$LAST_CMD" =~ ^doit([[:space:]]|$) ]]; then
         return
     fi
@@ -34,6 +36,17 @@ _doit_log_command() {
     # Append valid JSON entry to the log file
     if [[ -n "$ESCAPED_CMD" ]] && [[ -n "$ESCAPED_PWD" ]]; then
         echo "{\"timestamp\": \"$TIMESTAMP\", \"pwd\": $ESCAPED_PWD, \"command\": $ESCAPED_CMD}" >> "$DOIT_SHELL_LOG"
+    fi
+
+    # Rotate/trim log file if it exceeds MAX_LOG_LINES
+    if [ -f "$DOIT_SHELL_LOG" ]; then
+        local LINE_COUNT
+        LINE_COUNT=$(wc -l < "$DOIT_SHELL_LOG" 2>/dev/null || echo 0)
+        if [ "$LINE_COUNT" -gt "$MAX_LOG_LINES" ]; then
+            local TEMP_LOG="${DOIT_SHELL_LOG}.tmp"
+            tail -n "$TRIM_TO_LINES" "$DOIT_SHELL_LOG" > "$TEMP_LOG" 2>/dev/null
+            mv "$TEMP_LOG" "$DOIT_SHELL_LOG" 2>/dev/null
+        fi
     fi
 }
 
