@@ -4,7 +4,7 @@ import subprocess
 import threading
 import history_manager
 import memory_agent
-from llm_brain import query_llm
+from llm_brain import query_llm, handle_self_correction
 import os
 
 def run_shell(command: str, shell: str = "/bin/bash"):
@@ -102,44 +102,33 @@ def main():
         print(content)
 
         # SPECIAL HANDLING FOR 'cd' COMMANDS:
-        # Subprocesses cannot modify the parent terminal's working directory.
-        # If the command is a directory change, we change directory in Python and launch an interactive shell.
         if content.strip().startswith("cd ") or content.strip() == "cd":
-            # Extract target path (defaulting to HOME directory if bare 'cd')
             raw_path = content.strip()[3:].strip()
             target_dir = os.path.expanduser(raw_path) if raw_path else os.path.expanduser("~")
             
             try:
-                # 1. Change the working directory of the current process
                 os.chdir(target_dir)
-                
-                # 2. Record execution status in history
                 history_manager.update_last_turn_execution({
                     "stdout": f"Changed directory to {os.getcwd()}\n",
                     "stderr": "",
                     "returncode": 0
                 })
                 
-                # 3. Preserve active environment safely across subshells
                 user_shell = os.environ.get("SHELL", "/bin/bash")
                 conda_env = os.environ.get("CONDA_DEFAULT_ENV")
                 venv_path = os.environ.get("VIRTUAL_ENV")
 
-                # If running inside a non-base Conda environment (e.g. 'llm')
                 if conda_env and conda_env != "base":
                     import tempfile
-                    # Create a temporary rcfile that loads ~/.bashrc and re-activates the conda env
                     tmp_rc = tempfile.NamedTemporaryFile("w", delete=False, suffix="_rc")
                     tmp_rc.write(f'source ~/.bashrc 2>/dev/null\nconda activate "{conda_env}" 2>/dev/null\nrm -f "{tmp_rc.name}"\n')
                     tmp_rc.close()
-                    
                     os.execl(user_shell, user_shell, "--rcfile", tmp_rc.name, "-i")
                 elif venv_path:
                     import tempfile
                     tmp_rc = tempfile.NamedTemporaryFile("w", delete=False, suffix="_rc")
                     tmp_rc.write(f'source ~/.bashrc 2>/dev/null\nsource "{venv_path}/bin/activate" 2>/dev/null\nrm -f "{tmp_rc.name}"\n')
                     tmp_rc.close()
-                    
                     os.execl(user_shell, user_shell, "--rcfile", tmp_rc.name, "-i")
                 else:
                     os.execl(user_shell, user_shell, "-i")
@@ -154,20 +143,60 @@ def main():
                 })
             return
             
-        # Execute the final authorized command
+        # Execute the primary authorized command
         execution_result = run_shell(content)
         
         # Update the saved history turn with the actual terminal execution result
         history_manager.update_last_turn_execution(execution_result)
         
-        # Print the output and error if any
+        # Print output and error if any
         if execution_result["stdout"]:
             print(execution_result["stdout"], end="")
         if execution_result["stderr"]:
             print(f"Error output:\n{execution_result['stderr']}", end="")
+
+        # ---------------------------------------------------------------------
+        # 🧠 AUTOMATIC SELF-CORRECTION & ERROR RECOVERY MECHANISM
+        # ---------------------------------------------------------------------
+        if execution_result["returncode"] != 0 or execution_result["stderr"]:
+            correction_res = handle_self_correction(
+                failed_command=content,
+                stderr=execution_result["stderr"],
+                returncode=execution_result["returncode"]
+            )
+            
+            if correction_res and correction_res.get("should_fix"):
+                fix_cmd = correction_res.get("fixed_command")
+                reason = correction_res.get("explanation")
+                
+                print(f"\n🔧 [AUTOMATIC SELF-CORRECTION]")
+                print(f"❌ Original Command Failed: {content}")
+                print(f"💡 Root Cause Analysis:   {reason}")
+                print(f"👉 Proposed Fix Command:   {fix_cmd}")
+                
+                try:
+                    user_fix_choice = input("Would you like to execute the suggested fix? [y/N]: ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    print("\nCorrection cancelled by user.")
+                    return
+                    
+                if user_fix_choice == 'y':
+                    print(f"\nRunning fix: {fix_cmd}")
+                    fixed_exec_res = run_shell(fix_cmd)
+                    
+                    if fixed_exec_res["stdout"]:
+                        print(fixed_exec_res["stdout"], end="")
+                    if fixed_exec_res["stderr"]:
+                        print(f"Error output:\n{fixed_exec_res['stderr']}", end="")
+                        
+                    # Save the self-correction execution output into history
+                    history_manager.update_last_turn_execution({
+                        "stdout": f"[ORIGINAL FAILED]: {execution_result['stderr']}\n[SELF-CORRECTION APPLIED]: {fixed_exec_res['stdout']}",
+                        "stderr": fixed_exec_res["stderr"],
+                        "returncode": fixed_exec_res["returncode"]
+                    })
             
     elif action_type == "chat":
-        # Print a normal assistant chat response
         print(content)
         
     elif action_type == "error":

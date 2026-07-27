@@ -120,13 +120,8 @@ Only 'read-only' commands are safe (is_destructive: false). Anything that writes
 
 def build_messages_with_history(system_prompt: str, user_instruction: str) -> list:
     """
-    Combines system prompt, session-filtered conversation turns, and the current user instruction
-    into a structured list of messages for the LLM, properly formatting past tool calls and execution feedback.
-    
-    Session Scoping:
-    To prevent context contamination across multi-terminal workflows, only historical turns 
-    belonging to the active DOIT_SESSION_ID are injected as direct conversational messages.
-    Cross-session history remains available exclusively via the system prompt's activity timeline.
+    Combines system prompt, session-filtered conversation turns, and current user instruction.
+    Session Scoping: Only historical turns belonging to active DOIT_SESSION_ID are injected directly.
     """
     turns = history_manager.get_all_turns()
     current_session = os.environ.get("DOIT_SESSION_ID", "default_session")
@@ -134,15 +129,15 @@ def build_messages_with_history(system_prompt: str, user_instruction: str) -> li
     messages = [{"role": "system", "content": system_prompt}]
     
     for turn in turns:
-        # Filter out turns belonging to other terminal sessions/windows
+        # Session scoping filter
         turn_session = turn.get("session_id", "default_session")
         if turn_session != current_session:
             continue
             
-        # 1. Add user's original request for the active session
+        # 1. Add user's original request
         messages.append({"role": "user", "content": turn["user_instruction"]})
         
-        # 2. Reconstruct past clarification tool interactions if they exist
+        # 2. Reconstruct past clarification tool interactions
         assistant_resp = turn["assistant_response"]
         if "clarification_history" in assistant_resp:
             for item in assistant_resp["clarification_history"]:
@@ -165,11 +160,11 @@ def build_messages_with_history(system_prompt: str, user_instruction: str) -> li
                     "content": json.dumps({"user_response": item["user_response"]})
                 })
         
-        # 3. Add assistant's final JSON response (clean of internal clarification keys)
+        # 3. Add assistant's final JSON response
         clean_assistant_resp = {k: v for k, v in assistant_resp.items() if k != "clarification_history"}
         messages.append({"role": "assistant", "content": json.dumps(clean_assistant_resp)})
         
-        # 4. Add execution output feedback (stdout, stderr, returncode)
+        # 4. Add execution output feedback
         exec_res = turn.get("execution_result")
         if exec_res:
             stdout_clean = exec_res.get('stdout', '').strip() or "None"
@@ -190,6 +185,7 @@ def build_messages_with_history(system_prompt: str, user_instruction: str) -> li
     messages.append({"role": "user", "content": user_instruction})
     return messages
 
+
 def query_llm(user_instruction: str) -> dict:
     """Send the request to the LLM including multi-turn history, user memories, and live shell activity."""
     config = load_config()
@@ -205,17 +201,13 @@ def query_llm(user_instruction: str) -> dict:
     else:
         user_instruction = str(user_instruction)
 
-    # Internal list to collect clarification steps for history persistence
     clarification_history = []
-
-    # Load formatted active memories
     memories_context = memory_manager.get_formatted_memories(user_instruction)
 
-    # Fetch live current working directory and merged timeline (Shell + Agent)
     current_pwd = os.getcwd()
-    shell_timeline = shell_history_manager.get_combined_timeline(limit=15)
+    current_session_id = os.environ.get("DOIT_SESSION_ID", "default_session")
+    current_timeline, other_timeline = shell_history_manager.get_session_aware_timeline(limit=10)
 
-    # Define tools available for the LLM
     tools = [
         {
             "type": "function",
@@ -238,13 +230,13 @@ def query_llm(user_instruction: str) -> dict:
             "type": "function",
             "function": {
                 "name": "ask_user_clarification",
-                "description": "Call this tool when you are not sure about the user's intent, when there are multiple logical options, or when critical details are missing. You MUST provide explicit, numbered choices for the user.",
+                "description": "Call this tool when you are not sure about the user's intent, when there are multiple logical options, or when critical details are missing.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "question": {
                             "type": "string",
-                            "description": "The clarification question context to print to the user. E.g., 'Do you want to sort by:'"
+                            "description": "The clarification question context to print to the user."
                         },
                         "options": {
                             "type": "array",
@@ -259,9 +251,6 @@ def query_llm(user_instruction: str) -> dict:
             }
         }
     ]
-
-    current_session_id = os.environ.get("DOIT_SESSION_ID", "default_session")
-    current_timeline, other_timeline = shell_history_manager.get_session_aware_timeline(limit=10)
 
     system_prompt = f"""You are the brain of a CLI agent named 'doit'. You support multi-turn conversations and multi-tasking across separate terminal windows.
 
@@ -278,14 +267,25 @@ RECENT ACTIVITY IN OTHER TERMINAL WINDOWS:
 PERSISTENT USER MEMORIES:
 {memories_context}
 
-STRICT MULTI-TASKING & CONTEXT RULES:
+STRICT RULES:
 1. CONTEXT SCOPING:
-   - When the user uses implicit pronouns or relative instructions (e.g., 'sort them', 'why did that fail', 'delete it'), ALWAYS resolve them relative to the "RECENT ACTIVITY IN THIS TERMINAL WINDOW".
-   - Ignore actions from OTHER terminal windows unless the user explicitly refers to another window/session (e.g., "do the same thing we did in window 2", "repeat what was done in the other terminal").
+   - Resolve pronouns or implicit commands relative to RECENT ACTIVITY IN THIS TERMINAL WINDOW.
+   - Ignore actions in OTHER terminal windows unless user explicitly asks to repeat/refer to them.
 
-2. CROSS-WINDOW REPETITION:
-   - If the user explicitly asks to repeat an action from another terminal/window, extract the corresponding task/command from "RECENT ACTIVITY IN OTHER TERMINAL WINDOWS", adapt it to the current directory ({current_pwd}), and generate the appropriate command.
-"""
+2. COMMAND EXECUTION:
+   - If user demands an action in terminal, set action_type to "command" and call 'call_safety_check'.
+
+3. NON-COMMANDS:
+   - If user asks for info/explanations without execution, set action_type to "chat".
+
+4. OUTPUT FORMAT:
+   - Respond ONLY with valid JSON:
+   {{
+     "action_type": "command" | "chat" | "error",
+     "content": "the bash command OR explanation OR error message",
+     "is_destructive": true | false,
+     "explanation": "safety evaluation details"
+   }}"""
 
     messages = build_messages_with_history(system_prompt, user_instruction)
 
@@ -320,7 +320,7 @@ STRICT MULTI-TASKING & CONTEXT RULES:
                 
                 second_turn_prompt = """You are the brain of a CLI agent named 'doit'.
 You have received the safety check result for the command.
-You MUST respond with a valid JSON object. Do not include any markdown formatting, no thoughts, and no extra text.
+You MUST respond with a valid JSON object. Do not include markdown formatting.
 You MUST output a JSON response of action_type "command" containing the exact command in "content", and the tool's returned "is_destructive" and "explanation" values."""
                 messages[0]["content"] = second_turn_prompt
                 
@@ -369,9 +369,7 @@ You MUST output a JSON response of action_type "command" containing the exact co
         if clarification_history:
             final_response_dict["clarification_history"] = clarification_history
         
-        # Save to history file
         history_manager.add_turn(user_instruction, final_response_dict)
-        
         return final_response_dict
         
     except Exception as e:
@@ -381,3 +379,52 @@ You MUST output a JSON response of action_type "command" containing the exact co
             "is_destructive": False,
             "explanation": ""
         }
+
+
+# -----------------------------------------------------------------------------
+# 🔧 AUTOMATIC SELF-CORRECTION DIAGNOSTIC FUNCTION
+# -----------------------------------------------------------------------------
+def handle_self_correction(failed_command: str, stderr: str, returncode: int) -> dict:
+    """
+    Analyzes a failed command execution, diagnoses the root cause, and generates a corrected command.
+    """
+    config = load_config()
+    model = config["model"]
+    provider = config["provider"]
+
+    correction_system_prompt = """You are an expert Linux System Administrator and Self-Correction Agent for 'doit'.
+Your task is to analyze a failed bash command and generate a corrected command to fix the issue.
+
+Output MUST be a single valid JSON object with NO markdown formatting:
+{
+  "should_fix": true | false,
+  "explanation": "Brief description of why the command failed and how the fix resolves it",
+  "fixed_command": "The exact corrected bash command to execute"
+}
+
+Rules:
+1. ALWAYS set 'should_fix' to true if there is ANY logical recovery path (e.g., if a directory/file is missing, propose creating it with 'mkdir -p' or 'touch' before running the original command; if a command/flag is misspelled, fix it; if permissions fail, add 'sudo').
+2. Only set 'should_fix' to false if the command is completely meaningless or impossible in a Linux environment.
+"""
+
+    user_payload = f"""FAILED COMMAND: {failed_command}
+EXIT CODE: {returncode}
+ERROR STDERR: {stderr}"""
+
+    try:
+        response = litellm.completion(
+            model=model,
+            custom_llm_provider=provider,
+            messages=[
+                {"role": "system", "content": correction_system_prompt},
+                {"role": "user", "content": user_payload}
+            ],
+            system_instruction=correction_system_prompt,
+            temperature=0.0
+        )
+        raw_content = response.choices[0].message.content
+        cleaned = clean_json_markdown(raw_content)
+        return json.loads(cleaned)
+    except Exception as e:
+        # Print error for debugging if needed
+        return {"should_fix": False, "explanation": f"Error: {str(e)}", "fixed_command": ""}
