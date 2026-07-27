@@ -6,6 +6,13 @@ MAX_LOG_LINES=500
 TRIM_TO_LINES=200
 mkdir -p "$HOME/.doit"
 
+# -----------------------------------------------------------------------------
+# Step 1: Assign a unique Session ID for each terminal window/tab
+# -----------------------------------------------------------------------------
+if [ -z "$DOIT_SESSION_ID" ]; then
+    export DOIT_SESSION_ID="session_$(date +%s)_$$"
+fi
+
 _doit_log_command() {
     # Get the last executed command from history
     local LAST_CMD
@@ -22,20 +29,23 @@ _doit_log_command() {
     fi
     _DOIT_LAST_LOGGED_CMD="$LAST_CMD"
 
-    # Capture timestamp and current working directory
+    # Capture timestamp, current working directory, and session_id
     local TIMESTAMP
     TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     local CURRENT_PWD="$PWD"
+    local SESSION_ID="${DOIT_SESSION_ID:-default_session}"
 
-    # Safely escape command and path strings into valid JSON formats
+    # Safely escape command, path, and session strings into valid JSON formats
     local ESCAPED_CMD
     ESCAPED_CMD=$(python3 -c "import json, sys; print(json.dumps(sys.argv[1]))" "$LAST_CMD" 2>/dev/null)
     local ESCAPED_PWD
     ESCAPED_PWD=$(python3 -c "import json, sys; print(json.dumps(sys.argv[1]))" "$CURRENT_PWD" 2>/dev/null)
+    local ESCAPED_SESSION
+    ESCAPED_SESSION=$(python3 -c "import json, sys; print(json.dumps(sys.argv[1]))" "$SESSION_ID" 2>/dev/null)
 
-    # Append valid JSON entry to the log file
-    if [[ -n "$ESCAPED_CMD" ]] && [[ -n "$ESCAPED_PWD" ]]; then
-        echo "{\"timestamp\": \"$TIMESTAMP\", \"pwd\": $ESCAPED_PWD, \"command\": $ESCAPED_CMD}" >> "$DOIT_SHELL_LOG"
+    # Append valid JSON entry to the log file with session_id
+    if [[ -n "$ESCAPED_CMD" ]] && [[ -n "$ESCAPED_PWD" ]] && [[ -n "$ESCAPED_SESSION" ]]; then
+        echo "{\"timestamp\": \"$TIMESTAMP\", \"session_id\": $ESCAPED_SESSION, \"pwd\": $ESCAPED_PWD, \"command\": $ESCAPED_CMD}" >> "$DOIT_SHELL_LOG"
     fi
 
     # Rotate/trim log file if it exceeds MAX_LOG_LINES

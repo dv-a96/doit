@@ -41,13 +41,15 @@ def get_all_turns() -> list:
 
 def add_turn(user_instruction: str, assistant_response: dict):
     """
-    Add a new interaction turn. 
+    Add a new interaction turn with session tracking. 
     'assistant_response' is the JSON output dictionary from the LLM.
     """
     history = load_history()
+    session_id = os.environ.get("DOIT_SESSION_ID", "default_session")
     
     new_turn = {
         "timestamp": datetime.now().isoformat(),
+        "session_id": session_id,
         "user_instruction": user_instruction,
         "assistant_response": assistant_response,
         "execution_result": None  # Will be updated by the main process after execution

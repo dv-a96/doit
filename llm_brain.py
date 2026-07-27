@@ -120,14 +120,26 @@ Only 'read-only' commands are safe (is_destructive: false). Anything that writes
 
 def build_messages_with_history(system_prompt: str, user_instruction: str) -> list:
     """
-    Combines system prompt, saved history turns, and the current user instruction
-    into a structured list of messages for the LLM, properly formatting past tool calls.
+    Combines system prompt, session-filtered conversation turns, and the current user instruction
+    into a structured list of messages for the LLM, properly formatting past tool calls and execution feedback.
+    
+    Session Scoping:
+    To prevent context contamination across multi-terminal workflows, only historical turns 
+    belonging to the active DOIT_SESSION_ID are injected as direct conversational messages.
+    Cross-session history remains available exclusively via the system prompt's activity timeline.
     """
     turns = history_manager.get_all_turns()
+    current_session = os.environ.get("DOIT_SESSION_ID", "default_session")
+    
     messages = [{"role": "system", "content": system_prompt}]
     
     for turn in turns:
-        # 1. Add user's original request
+        # Filter out turns belonging to other terminal sessions/windows
+        turn_session = turn.get("session_id", "default_session")
+        if turn_session != current_session:
+            continue
+            
+        # 1. Add user's original request for the active session
         messages.append({"role": "user", "content": turn["user_instruction"]})
         
         # 2. Reconstruct past clarification tool interactions if they exist
@@ -153,11 +165,11 @@ def build_messages_with_history(system_prompt: str, user_instruction: str) -> li
                     "content": json.dumps({"user_response": item["user_response"]})
                 })
         
-        # 3. Add assistant's final JSON response (as a string)
+        # 3. Add assistant's final JSON response (clean of internal clarification keys)
         clean_assistant_resp = {k: v for k, v in assistant_resp.items() if k != "clarification_history"}
         messages.append({"role": "assistant", "content": json.dumps(clean_assistant_resp)})
         
-        # 4. Add execution output feedback (if exists)
+        # 4. Add execution output feedback (stdout, stderr, returncode)
         exec_res = turn.get("execution_result")
         if exec_res:
             stdout_clean = exec_res.get('stdout', '').strip() or "None"
@@ -174,10 +186,9 @@ def build_messages_with_history(system_prompt: str, user_instruction: str) -> li
                 "content": feedback
             })
             
-    # Append current instruction
+    # Append current active instruction
     messages.append({"role": "user", "content": user_instruction})
     return messages
-
 
 def query_llm(user_instruction: str) -> dict:
     """Send the request to the LLM including multi-turn history, user memories, and live shell activity."""
@@ -249,48 +260,32 @@ def query_llm(user_instruction: str) -> dict:
         }
     ]
 
-    system_prompt = f"""You are the brain of a CLI agent named 'doit'. You support multi-turn conversations, rich interactions, and full user terminal awareness.
-Analyze interaction history, live shell timeline, and persistent user memories to resolve contexts, paths, and preferences.
+    current_session_id = os.environ.get("DOIT_SESSION_ID", "default_session")
+    current_timeline, other_timeline = shell_history_manager.get_session_aware_timeline(limit=10)
+
+    system_prompt = f"""You are the brain of a CLI agent named 'doit'. You support multi-turn conversations and multi-tasking across separate terminal windows.
 
 CURRENT TERMINAL STATE:
-- Working Directory (PWD): {current_pwd}
+- Session ID: {current_session_id}
+- Current Working Directory (PWD): {current_pwd}
 
-RECENT TERMINAL ACTIVITY (USER & AGENT TIMELINE):
-{shell_timeline}
+RECENT ACTIVITY IN THIS TERMINAL WINDOW:
+{current_timeline}
+
+RECENT ACTIVITY IN OTHER TERMINAL WINDOWS:
+{other_timeline}
 
 PERSISTENT USER MEMORIES:
 {memories_context}
 
-STRICT RULES:
+STRICT MULTI-TASKING & CONTEXT RULES:
+1. CONTEXT SCOPING:
+   - When the user uses implicit pronouns or relative instructions (e.g., 'sort them', 'why did that fail', 'delete it'), ALWAYS resolve them relative to the "RECENT ACTIVITY IN THIS TERMINAL WINDOW".
+   - Ignore actions from OTHER terminal windows unless the user explicitly refers to another window/session (e.g., "do the same thing we did in window 2", "repeat what was done in the other terminal").
 
-1. USER & TERMINAL AWARENESS:
-   - You are fully aware of the current working directory ({current_pwd}) and recent shell history.
-   - Distinguish between actions manually run by [USER] and actions run by [AGENT (doit)].
-   - Use the recent terminal activity to understand context (e.g., if user manually ran 'cd ...' or 'mkdir ...', use that context when asked instructions like "summarize what I just did").
-
-2. MEMORY AWARENESS:
-   - Use the PERSISTENT USER MEMORIES list above to resolve shortcuts, project locations, or user preferences.
-
-3. NON-COMMANDS / EXPLANATIONAL REQUESTS:
-   - If the user asks "how to...", "how do I...", "explain...", "summarize...", or asks for information without explicitly demanding execution:
-     a) If the request is GENERAL or AMBIGUOUS with multiple distinct formats/methods: YOU MUST CALL 'ask_user_clarification' FIRST.
-     b) Once clear, set action_type to "chat" and provide focused explanation in 'content'.
-
-4. COMMAND EXECUTION REQUESTS & FOLLOW-UPS:
-   - If the user asks to navigate, change directory, or run ANY action in the terminal (e.g., 'move to home dir', 'go to project', 'make a new folder'), you MUST treat this as a terminal command and set action_type to 'command':
-     a) Set action_type to "command", call 'call_safety_check' on the exact final bash command, and return the JSON.
-
-5. PATH RESOLUTION:
-   - Always use full or explicit paths based on memories, current PWD ({current_pwd}), or history.
-
-6. OUTPUT FORMAT:
-   - Respond ONLY with valid JSON (NO markdown/code blocks):
-   {{
-     "action_type": "command" | "chat" | "error",
-     "content": "the bash command OR the text explanation/answer OR the error message",
-     "is_destructive": true | false,
-     "explanation": "the explanation returned by the safety tool, or empty if not a command"
-   }}"""
+2. CROSS-WINDOW REPETITION:
+   - If the user explicitly asks to repeat an action from another terminal/window, extract the corresponding task/command from "RECENT ACTIVITY IN OTHER TERMINAL WINDOWS", adapt it to the current directory ({current_pwd}), and generate the appropriate command.
+"""
 
     messages = build_messages_with_history(system_prompt, user_instruction)
 
